@@ -7,12 +7,17 @@
 #   git sweep                     # dry-run against main: show what WOULD be deleted + status of the rest
 #   git sweep -y                  # actually delete the merged branches
 #   git sweep --merged-to develop # sweep against another target branch
+#   git sweep --keep dev,release  # keep these branches even if merged (repeatable)
 #   git sweep --no-fetch          # skip the `git fetch --prune` refresh
 #   git sweep -h | --help
 #
 # A branch counts as "merged" when either:
 #   • its tip is an ancestor of origin/<target>  (normal / fast-forward merges), OR
 #   • its GitHub PR state is MERGED              (squash / rebase merges — no shared commit)
+#
+# Branches you always want to keep can be set once, per repo, instead of --keep:
+#   git config --add sweep.protect dev
+# The target branch and the branch you're on are always kept automatically.
 #
 # Requires: git, gh (GitHub CLI, authenticated). jq is optional.
 
@@ -21,6 +26,7 @@ set -euo pipefail
 TARGET="main"
 DO_DELETE=0
 DO_FETCH=1
+PROTECT=()
 
 die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 
@@ -28,10 +34,12 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --merged-to) TARGET="${2:-}"; [ -n "$TARGET" ] || die "--merged-to needs a branch name"; shift 2 ;;
     --merged-to=*) TARGET="${1#*=}"; shift ;;
+    --keep) [ -n "${2:-}" ] || die "--keep needs a branch name"; IFS=',' read -ra _keep <<<"$2"; PROTECT+=("${_keep[@]}"); shift 2 ;;
+    --keep=*) IFS=',' read -ra _keep <<<"${1#*=}"; PROTECT+=("${_keep[@]}"); shift ;;
     -y|--yes) DO_DELETE=1; shift ;;
     --no-fetch) DO_FETCH=0; shift ;;
     -h|--help)
-      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+      awk 'NR==1{next} /^set -euo/{exit} {sub(/^# ?/,""); print}' "$0"
       exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
@@ -39,6 +47,18 @@ done
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
 command -v gh >/dev/null 2>&1 || die "gh (GitHub CLI) not found — install it: https://cli.github.com"
+
+# protected branches: any --keep flags plus the repo's sweep.protect config values
+while IFS= read -r _p; do [ -n "$_p" ] && PROTECT+=("$_p"); done \
+  < <(git config --get-all sweep.protect 2>/dev/null || true)
+
+is_protected() {
+  local b="$1" p
+  for p in ${PROTECT[@]+"${PROTECT[@]}"}; do
+    [ "$b" = "$p" ] && return 0
+  done
+  return 1
+}
 
 # ── colours (disabled when not a TTY) ───────────────────────────────────────
 if [ -t 1 ]; then
@@ -61,11 +81,16 @@ git rev-parse --verify --quiet "refs/remotes/origin/$TARGET" >/dev/null \
 # ── classify every local branch ─────────────────────────────────────────────
 merged_branches=()
 kept_branches=()
+protected_branches=()
 
 while IFS= read -r branch; do
   [ -n "$branch" ] || continue
   [ "$branch" = "$TARGET" ] && continue
   [ "$branch" = "$CURRENT" ] && continue
+
+  if is_protected "$branch"; then
+    protected_branches+=("$branch"); continue
+  fi
 
   if git merge-base --is-ancestor "$branch" "origin/$TARGET" 2>/dev/null; then
     merged_branches+=("$branch"); continue
@@ -161,6 +186,14 @@ gh_jq() {
 # ── report: kept branches ───────────────────────────────────────────────────
 printf '\n%starget:%s origin/%s   %scurrent:%s %s\n\n' \
   "$C_BLD" "$C_RST" "$TARGET" "$C_BLD" "$C_RST" "$CURRENT"
+
+if [ "${#protected_branches[@]}" -gt 0 ]; then
+  printf '%s%d protected branch(es) — kept:%s\n' "$C_BLD" "${#protected_branches[@]}" "$C_RST"
+  for b in "${protected_branches[@]}"; do
+    printf '  %s● %s%s\n' "$C_DIM" "$b" "$C_RST"
+  done
+  printf '\n'
+fi
 
 if [ "${#kept_branches[@]}" -gt 0 ]; then
   printf '%s%d branch(es) NOT merged — status:%s\n' "$C_BLD" "${#kept_branches[@]}" "$C_RST"

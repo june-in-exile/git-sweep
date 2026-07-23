@@ -16,9 +16,24 @@ A branch counts as **merged** when either:
 git sweep                      # dry-run against main: list what WOULD be deleted + status of the rest
 git sweep -y                   # actually delete the merged branches
 git sweep --merged-to develop  # sweep against a target branch other than main
+git sweep --keep dev,release   # keep these branches even if merged
 git sweep --no-fetch           # skip the opening `git fetch --prune`
 git sweep -h                   # help
 ```
+
+## Protecting branches
+
+Some merged branches you want to keep anyway (a long-lived `dev`, a `release`
+line). Two ways:
+
+```bash
+git sweep -y --keep dev            # one-off: keep dev for this run (comma-separated, repeatable)
+git config --add sweep.protect dev # permanent, per repo: kept on every run from now on
+```
+
+Protected branches are listed under **kept** in the output and never deleted.
+The target branch and the branch you're currently on are always kept
+automatically.
 
 Example output:
 
