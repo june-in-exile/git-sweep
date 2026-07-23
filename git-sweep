@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+#
+# git-sweep — delete local branches already merged into origin's target branch,
+# and report the live status (PR / conflict / reviews) of the ones left behind.
+#
+# Usage:
+#   git sweep                     # dry-run against main: show what WOULD be deleted + status of the rest
+#   git sweep -y                  # actually delete the merged branches
+#   git sweep --merged-to develop # sweep against another target branch
+#   git sweep --no-fetch          # skip the `git fetch --prune` refresh
+#   git sweep -h | --help
+#
+# A branch counts as "merged" when either:
+#   • its tip is an ancestor of origin/<target>  (normal / fast-forward merges), OR
+#   • its GitHub PR state is MERGED              (squash / rebase merges — no shared commit)
+#
+# Requires: git, gh (GitHub CLI, authenticated). jq is optional.
+
+set -euo pipefail
+
+TARGET="main"
+DO_DELETE=0
+DO_FETCH=1
+
+die() { printf '\033[31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --merged-to) TARGET="${2:-}"; [ -n "$TARGET" ] || die "--merged-to needs a branch name"; shift 2 ;;
+    --merged-to=*) TARGET="${1#*=}"; shift ;;
+    -y|--yes) DO_DELETE=1; shift ;;
+    --no-fetch) DO_FETCH=0; shift ;;
+    -h|--help)
+      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) die "unknown option: $1 (see --help)" ;;
+  esac
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "not inside a git repository"
+command -v gh >/dev/null 2>&1 || die "gh (GitHub CLI) not found — install it: https://cli.github.com"
+
+# ── colours (disabled when not a TTY) ───────────────────────────────────────
+if [ -t 1 ]; then
+  C_RST=$'\033[0m'; C_DIM=$'\033[2m'; C_GRN=$'\033[32m'; C_YEL=$'\033[33m'
+  C_RED=$'\033[31m'; C_CYN=$'\033[36m'; C_BLD=$'\033[1m'
+else
+  C_RST=; C_DIM=; C_GRN=; C_YEL=; C_RED=; C_CYN=; C_BLD=
+fi
+
+CURRENT="$(git rev-parse --abbrev-ref HEAD)"
+
+if [ "$DO_FETCH" -eq 1 ]; then
+  printf '%s\n' "${C_DIM}fetching origin (prune)…${C_RST}"
+  git fetch --prune --quiet origin || die "git fetch failed"
+fi
+
+git rev-parse --verify --quiet "refs/remotes/origin/$TARGET" >/dev/null \
+  || die "origin/$TARGET not found — is '$TARGET' the right target? (--merged-to)"
+
+# ── classify every local branch ─────────────────────────────────────────────
+merged_branches=()
+kept_branches=()
+
+while IFS= read -r branch; do
+  [ -n "$branch" ] || continue
+  [ "$branch" = "$TARGET" ] && continue
+  [ "$branch" = "$CURRENT" ] && continue
+
+  if git merge-base --is-ancestor "$branch" "origin/$TARGET" 2>/dev/null; then
+    merged_branches+=("$branch"); continue
+  fi
+
+  # squash / rebase merges leave no shared commit — ask GitHub
+  pr_state="$(gh pr view "$branch" --json state --jq '.state' 2>/dev/null || true)"
+  if [ "$pr_state" = "MERGED" ]; then
+    merged_branches+=("$branch")
+  else
+    kept_branches+=("$branch")
+  fi
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+# ── describe the status of a branch we are NOT deleting ─────────────────────
+describe_status() {
+  local branch="$1" json
+  json="$(gh pr view "$branch" \
+    --json number,state,isDraft,mergeStateStatus,reviewDecision,reviews,comments \
+    2>/dev/null || true)"
+
+  if [ -z "$json" ]; then
+    printf '%s' "${C_DIM}no PR${C_RST}"
+    return
+  fi
+
+  # latest review state per author, then tallies
+  local read_vals
+  read_vals="$(printf '%s' "$json" | gh_jq '
+    (.reviews // [])
+      | group_by(.author.login)
+      | map(sort_by(.submittedAt) | last)
+      as $latest
+    | {
+        number: .number,
+        state: .state,
+        draft: .isDraft,
+        merge: (.mergeStateStatus // ""),
+        decision: (.reviewDecision // ""),
+        approvals: ([$latest[] | select(.state=="APPROVED")] | length),
+        changes:  ([$latest[] | select(.state=="CHANGES_REQUESTED")] | length),
+        comments: ((.comments // []) | length)
+      }
+    | "\(.number)\t\(.state)\t\(.draft)\t\(.merge)\t\(.decision)\t\(.approvals)\t\(.changes)\t\(.comments)"
+  ')"
+
+  local num st draft merge decision approvals changes comments
+  IFS=$'\t' read -r num st draft merge decision approvals changes comments <<<"$read_vals"
+
+  local parts=()
+  local head
+  if [ "$st" = "OPEN" ] && [ "$draft" = "true" ]; then
+    head="${C_DIM}#${num} draft${C_RST}"
+  elif [ "$st" = "OPEN" ]; then
+    head="${C_CYN}#${num} open${C_RST}"
+  elif [ "$st" = "CLOSED" ]; then
+    head="${C_RED}#${num} closed${C_RST}"
+  else
+    head="#${num} ${st}"
+  fi
+  parts+=("$head")
+
+  case "$merge" in
+    CONFLICTING) parts+=("${C_RED}conflict${C_RST}") ;;
+    BEHIND)      parts+=("${C_YEL}behind${C_RST}") ;;
+    BLOCKED)     parts+=("${C_YEL}blocked${C_RST}") ;;
+    UNSTABLE)    parts+=("${C_YEL}checks failing${C_RST}") ;;
+    DIRTY)       parts+=("${C_RED}conflict${C_RST}") ;;
+  esac
+
+  case "$decision" in
+    APPROVED)          parts+=("${C_GRN}approved${C_RST}") ;;
+    CHANGES_REQUESTED) parts+=("${C_RED}changes requested${C_RST}") ;;
+    REVIEW_REQUIRED)   parts+=("${C_DIM}review required${C_RST}") ;;
+  esac
+
+  local votes=()
+  [ "${approvals:-0}" -gt 0 ] 2>/dev/null && votes+=("✔${approvals}")
+  [ "${changes:-0}" -gt 0 ]   2>/dev/null && votes+=("✗${changes}")
+  [ "${comments:-0}" -gt 0 ]  2>/dev/null && votes+=("💬${comments}")
+  [ "${#votes[@]}" -gt 0 ] && parts+=("${votes[*]}")
+
+  local IFS=' · '
+  printf '%s' "${parts[*]}"
+}
+
+# jq wrapper — jq is required for the review tallies
+gh_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq not found — install it: brew install jq"
+  jq -r "$1"
+}
+
+# ── report: kept branches ───────────────────────────────────────────────────
+printf '\n%starget:%s origin/%s   %scurrent:%s %s\n\n' \
+  "$C_BLD" "$C_RST" "$TARGET" "$C_BLD" "$C_RST" "$CURRENT"
+
+if [ "${#kept_branches[@]}" -gt 0 ]; then
+  printf '%s%d branch(es) NOT merged — status:%s\n' "$C_BLD" "${#kept_branches[@]}" "$C_RST"
+  for b in "${kept_branches[@]}"; do
+    printf '  %-40s %s\n' "$b" "$(describe_status "$b")"
+  done
+  printf '\n'
+else
+  printf '%sno un-merged branches.%s\n\n' "$C_DIM" "$C_RST"
+fi
+
+# ── report + act: merged branches ───────────────────────────────────────────
+if [ "${#merged_branches[@]}" -eq 0 ]; then
+  printf '%snothing merged into origin/%s to delete.%s\n' "$C_DIM" "$TARGET" "$C_RST"
+  exit 0
+fi
+
+if [ "$DO_DELETE" -eq 1 ]; then
+  printf '%s%d merged branch(es) — deleting:%s\n' "$C_BLD" "${#merged_branches[@]}" "$C_RST"
+  for b in "${merged_branches[@]}"; do
+    if git branch -D "$b" >/dev/null 2>&1; then
+      printf '  %s✔ deleted%s %s\n' "$C_GRN" "$C_RST" "$b"
+    else
+      printf '  %s✗ failed%s  %s\n' "$C_RED" "$C_RST" "$b"
+    fi
+  done
+else
+  printf '%s%d merged branch(es) — would delete (dry-run, pass -y to apply):%s\n' \
+    "$C_BLD" "${#merged_branches[@]}" "$C_RST"
+  for b in "${merged_branches[@]}"; do
+    printf '  %s· %s%s\n' "$C_DIM" "$b" "$C_RST"
+  done
+  printf '\n%srun %sgit sweep -y%s %sto delete them.%s\n' "$C_DIM" "$C_BLD" "$C_RST" "$C_DIM" "$C_RST"
+fi
