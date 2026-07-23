@@ -64,23 +64,25 @@ The dry-run is the default; nothing is deleted until you pass `-y`.
 ## Install
 
 `git` treats any executable named `git-sweep` on your `PATH` as the `git sweep`
-subcommand.
+subcommand, so installing just means putting this repo on your `PATH` — no
+symlink, no copy. `git sweep` then runs the script right here in the clone, and
+a later `git pull` updates it in place.
 
 ```bash
-git clone https://github.com/june-in-exile/git-sweep ~/Projects/git-sweep
-~/Projects/git-sweep/install.sh
+git clone https://github.com/june-in-exile/git-sweep ~/Developer/git-sweep
+~/Developer/git-sweep/install.sh
 ```
 
-`install.sh` symlinks the script into `~/bin` and reminds you to put `~/bin` on
-your `PATH`. Because it's a symlink, a later `git pull` in the clone updates the
-installed command automatically.
+If the repo isn't on your `PATH` yet, `install.sh` offers to add it to your
+shell config (`~/.zshrc`, `~/.bashrc`, …) — press Enter to accept. Then run
+`source <that file>` and `git sweep` is ready. Pass `--yes` to skip the prompt.
+It's idempotent, so re-running never duplicates the line.
 
 Manual install instead:
 
 ```bash
-ln -s ~/Projects/git-sweep/git-sweep ~/bin/git-sweep
-# ensure ~/bin is on PATH — add to ~/.zshrc:
-#   export PATH="$HOME/bin:$PATH"
+# add the clone to PATH — append to ~/.zshrc:
+#   export PATH="$HOME/Developer/git-sweep:$PATH"
 ```
 
 ## License
