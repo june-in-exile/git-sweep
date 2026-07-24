@@ -13,11 +13,15 @@ pass=0; fail=0
 ok()  { printf '  \033[32mok\033[0m   %s\n' "$1"; pass=$((pass+1)); }
 bad() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=$((fail+1)); }
 
+# PATH with the repo dir stripped out — simulates a machine where git-sweep is
+# not installed yet, even when these tests run from a shell that already has it.
+CLEAN_PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vFx "$ROOT" | paste -sd: -)"
+
 # Run install.sh with a fresh fake HOME (so the repo dir is not yet on PATH).
 # Args pass straight to install.sh. Echoes the temp HOME path.
 run_install() {
   local home; home="$(mktemp -d)"
-  HOME="$home" SHELL="/bin/zsh" \
+  HOME="$home" SHELL="/bin/zsh" PATH="$CLEAN_PATH" \
     "$INSTALL" "$@" </dev/null >/dev/null 2>&1 || true
   printf '%s' "$home"
 }
@@ -36,7 +40,7 @@ else
 fi
 
 # 2. --yes is idempotent (second run does not duplicate the line)
-HOME="$h" SHELL="/bin/zsh" "$INSTALL" --yes </dev/null >/dev/null 2>&1 || true
+HOME="$h" SHELL="/bin/zsh" PATH="$CLEAN_PATH" "$INSTALL" --yes </dev/null >/dev/null 2>&1 || true
 if [ "$(count_repo_line "$h/.zshrc")" -eq 1 ]; then
   ok "--yes twice leaves a single PATH line"
 else
