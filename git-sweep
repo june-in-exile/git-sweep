@@ -120,19 +120,19 @@ describe_status() {
   # latest review state per author, then tallies
   local read_vals
   read_vals="$(printf '%s' "$json" | gh_jq '
-    (.reviews // [])
-      | group_by(.author.login)
-      | map(sort_by(.submittedAt) | last)
-      as $latest
+    . as $pr
+    | (($pr.reviews // [])
+        | group_by(.author.login)
+        | map(sort_by(.submittedAt) | last)) as $latest
     | {
-        number: .number,
-        state: .state,
-        draft: .isDraft,
-        merge: (.mergeStateStatus // ""),
-        decision: (.reviewDecision // ""),
+        number: $pr.number,
+        state: $pr.state,
+        draft: $pr.isDraft,
+        merge: ($pr.mergeStateStatus // ""),
+        decision: ($pr.reviewDecision // ""),
         approvals: ([$latest[] | select(.state=="APPROVED")] | length),
         changes:  ([$latest[] | select(.state=="CHANGES_REQUESTED")] | length),
-        comments: ((.comments // []) | length)
+        comments: (($pr.comments // []) | length)
       }
     | "\(.number)\t\(.state)\t\(.draft)\t\(.merge)\t\(.decision)\t\(.approvals)\t\(.changes)\t\(.comments)"
   ')"
