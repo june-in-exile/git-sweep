@@ -70,6 +70,23 @@ fi
 
 CURRENT="$(git rev-parse --abbrev-ref HEAD)"
 
+# branches checked out in ANY worktree can't be deleted — git refuses. Collect
+# them so we can skip with a clear message instead of a generic failure.
+worktree_branches=()
+while IFS= read -r _line; do
+  case "$_line" in
+    "branch refs/heads/"*) worktree_branches+=("${_line#branch refs/heads/}") ;;
+  esac
+done < <(git worktree list --porcelain 2>/dev/null || true)
+
+in_worktree() {
+  local b="$1" w
+  for w in ${worktree_branches[@]+"${worktree_branches[@]}"}; do
+    [ "$b" = "$w" ] && return 0
+  done
+  return 1
+}
+
 if [ "$DO_FETCH" -eq 1 ]; then
   printf '%s\n' "${C_DIM}fetching origin (prune)…${C_RST}"
   git fetch --prune --quiet origin || die "git fetch failed"
@@ -214,7 +231,10 @@ fi
 if [ "$DO_DELETE" -eq 1 ]; then
   printf '%s%d merged branch(es) — deleting:%s\n' "$C_BLD" "${#merged_branches[@]}" "$C_RST"
   for b in "${merged_branches[@]}"; do
-    if git branch -D "$b" >/dev/null 2>&1; then
+    if in_worktree "$b"; then
+      printf '  %s✗ skipped%s %s %s(in use by another worktree)%s\n' \
+        "$C_YEL" "$C_RST" "$b" "$C_DIM" "$C_RST"
+    elif git branch -D "$b" >/dev/null 2>&1; then
       printf '  %s✔ deleted%s %s\n' "$C_GRN" "$C_RST" "$b"
     else
       printf '  %s✗ failed%s  %s\n' "$C_RED" "$C_RST" "$b"
@@ -224,7 +244,12 @@ else
   printf '%s%d merged branch(es) — would delete (dry-run, pass -y to apply):%s\n' \
     "$C_BLD" "${#merged_branches[@]}" "$C_RST"
   for b in "${merged_branches[@]}"; do
-    printf '  %s· %s%s\n' "$C_DIM" "$b" "$C_RST"
+    if in_worktree "$b"; then
+      printf '  %s· %s%s %s(in use by another worktree — will be skipped)%s\n' \
+        "$C_DIM" "$b" "$C_RST" "$C_YEL" "$C_RST"
+    else
+      printf '  %s· %s%s\n' "$C_DIM" "$b" "$C_RST"
+    fi
   done
   printf '\n%srun %sgit sweep -y%s %sto delete them.%s\n' "$C_DIM" "$C_BLD" "$C_RST" "$C_DIM" "$C_RST"
 fi
